@@ -20,27 +20,116 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Allow overriding the store location (e.g. portable installs). Otherwise try
-# both the classic installer path and the packaged app path.
+# known install paths, then do a bounded search under app-data roots.
+function Add-UniquePath([System.Collections.ArrayList]$paths, [string]$path) {
+    if ($path -and -not $paths.Contains($path)) {
+        [void]$paths.Add($path)
+    }
+}
+
+function Get-KnownClaudeUserDataCandidates {
+    $candidates = [System.Collections.ArrayList]@()
+
+    if ($env:APPDATA) {
+        Add-UniquePath $candidates (Join-Path $env:APPDATA 'Claude')
+    }
+
+    if ($env:LOCALAPPDATA) {
+        Add-UniquePath $candidates (Join-Path $env:LOCALAPPDATA 'Claude')
+
+        $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+        if (Test-Path $packagesRoot) {
+            foreach ($pkg in Get-ChildItem $packagesRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue) {
+                Add-UniquePath $candidates (Join-Path $pkg.FullName 'LocalCache\Roaming\Claude')
+            }
+        }
+    }
+
+    return @($candidates)
+}
+
+function Find-ClaudeUserDataCandidates {
+    $candidates = [System.Collections.ArrayList]@()
+    $searchRoots = @()
+
+    if ($env:APPDATA -and (Test-Path $env:APPDATA)) {
+        $searchRoots += [pscustomobject]@{ Path = $env:APPDATA; Depth = 4 }
+    }
+    if ($env:LOCALAPPDATA) {
+        $localClaude = Join-Path $env:LOCALAPPDATA 'Claude'
+        if (Test-Path $localClaude) {
+            $searchRoots += [pscustomobject]@{ Path = $localClaude; Depth = 4 }
+        }
+
+        $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+        if (Test-Path $packagesRoot) {
+            $searchRoots += [pscustomobject]@{ Path = $packagesRoot; Depth = 5 }
+        }
+    }
+
+    foreach ($root in $searchRoots) {
+        try {
+            foreach ($store in Get-ChildItem $root.Path -Directory -Filter 'claude-code-sessions' -Recurse -Depth $root.Depth -ErrorAction SilentlyContinue) {
+                Add-UniquePath $candidates (Split-Path $store.FullName -Parent)
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return @($candidates)
+}
+
+function Get-ClaudeSessionStoreInfo([string]$userData) {
+    $storeDir = Join-Path $userData 'claude-code-sessions'
+    $bucketCount = 0
+    $chatCount = 0
+    $lastActive = $null
+    $uuidPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+    if (Test-Path $storeDir) {
+        foreach ($accDir in Get-ChildItem $storeDir -Directory -ErrorAction SilentlyContinue) {
+            if ($accDir.Name -notmatch $uuidPattern) { continue }
+            foreach ($orgDir in Get-ChildItem $accDir.FullName -Directory -ErrorAction SilentlyContinue) {
+                if ($orgDir.Name -notmatch $uuidPattern) { continue }
+                $files = @(Get-ChildItem $orgDir.FullName -File -Filter 'local_*.json' -ErrorAction SilentlyContinue)
+                if ($files.Count -gt 0) {
+                    $bucketCount++
+                    $chatCount += $files.Count
+                    $newest = @($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0]
+                    if ($newest -and (-not $lastActive -or $newest.LastWriteTime -gt $lastActive)) {
+                        $lastActive = $newest.LastWriteTime
+                    }
+                }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        UserData    = $userData
+        StoreDir    = $storeDir
+        Exists      = Test-Path $storeDir
+        BucketCount = $bucketCount
+        ChatCount   = $chatCount
+        LastActive  = $lastActive
+        IsValid     = $bucketCount -gt 0
+    }
+}
+
 function Get-ClaudeUserDataCandidates {
     if ($env:CLAUDE_USER_DATA) {
         return @($env:CLAUDE_USER_DATA)
     }
 
-    $candidates = @()
-    if ($env:APPDATA) {
-        $candidates += Join-Path $env:APPDATA 'Claude'
+    $candidates = [System.Collections.ArrayList]@()
+    foreach ($candidate in Get-KnownClaudeUserDataCandidates) {
+        Add-UniquePath $candidates $candidate
+    }
+    foreach ($candidate in Find-ClaudeUserDataCandidates) {
+        Add-UniquePath $candidates $candidate
     }
 
-    if ($env:LOCALAPPDATA) {
-        $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
-        if (Test-Path $packagesRoot) {
-            foreach ($pkg in Get-ChildItem $packagesRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue) {
-                $candidates += Join-Path $pkg.FullName 'LocalCache\Roaming\Claude'
-            }
-        }
-    }
-
-    return @($candidates | Select-Object -Unique)
+    return @($candidates)
 }
 
 $UserDataCandidates = @(Get-ClaudeUserDataCandidates)
@@ -48,27 +137,18 @@ if ($UserDataCandidates.Count -eq 0) {
     $UserDataCandidates = @(Join-Path $HOME 'AppData\Roaming\Claude')
 }
 
-$UserData = $null
-foreach ($candidate in $UserDataCandidates) {
-    if (Test-Path (Join-Path $candidate 'claude-code-sessions')) {
-        $UserData = $candidate
-        break
-    }
-}
-if (-not $UserData) {
-    $UserData = $UserDataCandidates[0]
-}
+$StoreMatches = @($UserDataCandidates | ForEach-Object { Get-ClaudeSessionStoreInfo $_ })
+$ValidStores = @($StoreMatches | Where-Object { $_.IsValid } | Sort-Object ChatCount, BucketCount, LastActive -Descending)
+$UserData = if ($ValidStores.Count -gt 0) { $ValidStores[0].UserData } else { $UserDataCandidates[0] }
 $StoreDir  = Join-Path $UserData 'claude-code-sessions'
 $LogFile   = Join-Path $UserData 'logs\main.log'
 $LabelFile = Join-Path $PSScriptRoot 'accounts.conf'
 
 if (-not (Test-Path $StoreDir)) {
     Write-Host "Session store not found: $StoreDir" -ForegroundColor Red
-    if ($UserDataCandidates.Count -gt 1) {
-        Write-Host "Checked locations:"
-        foreach ($candidate in $UserDataCandidates) {
-            Write-Host "  - $(Join-Path $candidate 'claude-code-sessions')"
-        }
+    Write-Host "Checked locations:"
+    foreach ($match in $StoreMatches) {
+        Write-Host "  - $($match.StoreDir)"
     }
     Write-Host "Is Claude Desktop installed, and has Claude Code been used in it?"
     exit 1

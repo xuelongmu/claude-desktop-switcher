@@ -78,3 +78,8 @@ want a safety net, copy the `claude-code-sessions` folder somewhere first.
 
 If your install keeps its data somewhere non-standard, set `CLAUDE_USER_DATA`
 to the app's data folder before running.
+
+On Windows, `sync.ps1` first checks the known classic and packaged app
+locations above. If neither works, it does a bounded search under the relevant
+AppData roots for a real `claude-code-sessions` store and uses the valid store
+with the most local chat entries.
