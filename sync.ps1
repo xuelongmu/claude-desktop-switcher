@@ -232,56 +232,73 @@ if ($Buckets.Count -lt 2) {
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Show the accounts
-# ---------------------------------------------------------------------------
-Write-Host ""
-Write-Host "Claude Desktop accounts on this machine" -ForegroundColor Cyan
-Write-Host "(the app doesn't store emails on disk, so accounts are identified by their chats)" -ForegroundColor DarkGray
-
-$i = 0
-foreach ($b in $Buckets) {
-    $i++
-    if ($Labels.ContainsKey($b.Key)) {
-        $header = "[$i] $($Labels[$b.Key])"
-    } else {
-        $header = "[$i] unnamed account ($($b.AccountUuid.Substring(0,8))...)"
-    }
-    if ($b.AccountUuid -eq $LastSignedIn) { $header += "   <- last signed in" }
-
-    Write-Host ""
-    Write-Host $header -ForegroundColor White
-    if ($b.LastActive) {
-        Write-Host ("    {0} chats | last active {1:yyyy-MM-dd HH:mm}" -f $b.Count, $b.LastActive)
-    } else {
-        Write-Host ("    {0} chats" -f $b.Count)
-    }
-    if ($b.Projects.Count -gt 0) {
-        Write-Host ("    projects: {0}" -f ($b.Projects -join ', '))
-    }
-    foreach ($t in $b.Titles) {
-        Write-Host ("      - {0}" -f $t) -ForegroundColor DarkGray
-    }
+function Get-BucketDisplayName([object]$b) {
+    if ($script:Labels.ContainsKey($b.AccountUuid)) { return $script:Labels[$b.AccountUuid] }
+    if ($script:Labels.ContainsKey($b.Key)) { return $script:Labels[$b.Key] }
+    return "account $($b.AccountUuid.Substring(0,8))..."
 }
-Write-Host ""
+
+function Get-BucketLabel([object]$b) {
+    if ($script:Labels.ContainsKey($b.AccountUuid)) { return $script:Labels[$b.AccountUuid] }
+    if ($script:Labels.ContainsKey($b.Key)) { return $script:Labels[$b.Key] }
+    return $null
+}
+
+function Write-BucketList {
+    Write-Host ""
+    Write-Host "Claude Desktop accounts on this machine" -ForegroundColor Cyan
+    Write-Host "(the app doesn't store emails on disk, so accounts are identified by their chats)" -ForegroundColor DarkGray
+
+    $i = 0
+    foreach ($b in $script:Buckets) {
+        $i++
+        $label = Get-BucketLabel $b
+        if ($label) {
+            $header = "[$i] $label ($($b.AccountUuid.Substring(0,8))...)"
+        } else {
+            $header = "[$i] unnamed account ($($b.AccountUuid.Substring(0,8))...)"
+        }
+        if ($b.AccountUuid -eq $script:LastSignedIn) { $header += "   <- last signed in" }
+
+        Write-Host ""
+        Write-Host $header -ForegroundColor White
+        if ($b.LastActive) {
+            Write-Host ("    {0} chats | last active {1:yyyy-MM-dd HH:mm}" -f $b.Count, $b.LastActive)
+        } else {
+            Write-Host ("    {0} chats" -f $b.Count)
+        }
+        if ($b.Projects.Count -gt 0) {
+            Write-Host ("    projects: {0}" -f ($b.Projects -join ', '))
+        }
+        foreach ($t in $b.Titles) {
+            Write-Host ("      - {0}" -f $t) -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ""
+}
+
+# ---------------------------------------------------------------------------
+# Show and optionally name the accounts
+# ---------------------------------------------------------------------------
+Write-BucketList
 
 if ($List) { exit 0 }
 
-# ---------------------------------------------------------------------------
-# Offer to name unnamed accounts (saved to accounts.conf for next time)
-# ---------------------------------------------------------------------------
+$labelsChanged = $false
 $i = 0
 foreach ($b in $Buckets) {
     $i++
-    if (-not $Labels.ContainsKey($b.Key)) {
-        $name = Read-Host "Name for account [$i] (e.g. 'zerospace dev', Enter to skip)"
-        if ($name) { Save-Label $b.Key $name }
+    if (-not (Get-BucketLabel $b)) {
+        $name = Read-Host "Name for account [$i] (e.g. 'work', Enter to skip)"
+        if ($name) {
+            Save-Label $b.AccountUuid $name
+            $labelsChanged = $true
+        }
     }
 }
 
-function Get-BucketDisplayName([object]$b) {
-    if ($script:Labels.ContainsKey($b.Key)) { return $script:Labels[$b.Key] }
-    return "account $($b.AccountUuid.Substring(0,8))..."
+if ($labelsChanged) {
+    Write-BucketList
 }
 
 # ---------------------------------------------------------------------------
@@ -298,8 +315,39 @@ function Select-Bucket([string]$promptText, [int]$exclude) {
     }
 }
 
-$srcIdx = Select-Bucket "Copy chats FROM account #" 0
-$dstIdx = Select-Bucket "Copy chats TO account #" $srcIdx
+function Select-BucketPair {
+    while ($true) {
+        $raw = Read-Host "Copy chats FROM,TO account numbers (e.g. 1,2; Enter for separate prompts)"
+        if (-not $raw) {
+            $source = Select-Bucket "Copy chats FROM account #" 0
+            $destination = Select-Bucket "Copy chats TO account #" $source
+            return [pscustomobject]@{ Source = $source; Destination = $destination }
+        }
+
+        $matches = @([regex]::Matches($raw, '\d+') | ForEach-Object { [int]$_.Value })
+        if ($matches.Count -ne 2) {
+            Write-Host "Enter exactly two account numbers, like 1,2." -ForegroundColor Yellow
+            continue
+        }
+
+        $source = $matches[0]
+        $destination = $matches[1]
+        if ($source -lt 1 -or $source -gt $script:Buckets.Count -or $destination -lt 1 -or $destination -gt $script:Buckets.Count) {
+            Write-Host "Enter numbers from 1 to $($script:Buckets.Count)." -ForegroundColor Yellow
+            continue
+        }
+        if ($source -eq $destination) {
+            Write-Host "Source and destination must be different accounts." -ForegroundColor Yellow
+            continue
+        }
+
+        return [pscustomobject]@{ Source = $source; Destination = $destination }
+    }
+}
+
+$selection = Select-BucketPair
+$srcIdx = $selection.Source
+$dstIdx = $selection.Destination
 $src = $Buckets[$srcIdx - 1]
 $dst = $Buckets[$dstIdx - 1]
 

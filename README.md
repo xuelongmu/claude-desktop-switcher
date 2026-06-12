@@ -53,6 +53,9 @@ directly.) You can give each account a friendly name; names are remembered in
 Then pick a source and destination, confirm, done. Run it again with the
 accounts swapped if you want both directions.
 
+In the interactive prompt, you can enter source and destination together as
+`1,2` to copy from account 1 to account 2.
+
 ## Sync semantics
 
 - **Additive only.** Copies index entries that are missing at the destination.
