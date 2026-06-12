@@ -19,11 +19,44 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Allow overriding the store location (e.g. portable installs)
-if ($env:CLAUDE_USER_DATA) {
-    $UserData = $env:CLAUDE_USER_DATA
-} else {
-    $UserData = Join-Path $env:APPDATA 'Claude'
+# Allow overriding the store location (e.g. portable installs). Otherwise try
+# both the classic installer path and the packaged app path.
+function Get-ClaudeUserDataCandidates {
+    if ($env:CLAUDE_USER_DATA) {
+        return @($env:CLAUDE_USER_DATA)
+    }
+
+    $candidates = @()
+    if ($env:APPDATA) {
+        $candidates += Join-Path $env:APPDATA 'Claude'
+    }
+
+    if ($env:LOCALAPPDATA) {
+        $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+        if (Test-Path $packagesRoot) {
+            foreach ($pkg in Get-ChildItem $packagesRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue) {
+                $candidates += Join-Path $pkg.FullName 'LocalCache\Roaming\Claude'
+            }
+        }
+    }
+
+    return @($candidates | Select-Object -Unique)
+}
+
+$UserDataCandidates = @(Get-ClaudeUserDataCandidates)
+if ($UserDataCandidates.Count -eq 0) {
+    $UserDataCandidates = @(Join-Path $HOME 'AppData\Roaming\Claude')
+}
+
+$UserData = $null
+foreach ($candidate in $UserDataCandidates) {
+    if (Test-Path (Join-Path $candidate 'claude-code-sessions')) {
+        $UserData = $candidate
+        break
+    }
+}
+if (-not $UserData) {
+    $UserData = $UserDataCandidates[0]
 }
 $StoreDir  = Join-Path $UserData 'claude-code-sessions'
 $LogFile   = Join-Path $UserData 'logs\main.log'
@@ -31,6 +64,12 @@ $LabelFile = Join-Path $PSScriptRoot 'accounts.conf'
 
 if (-not (Test-Path $StoreDir)) {
     Write-Host "Session store not found: $StoreDir" -ForegroundColor Red
+    if ($UserDataCandidates.Count -gt 1) {
+        Write-Host "Checked locations:"
+        foreach ($candidate in $UserDataCandidates) {
+            Write-Host "  - $(Join-Path $candidate 'claude-code-sessions')"
+        }
+    }
     Write-Host "Is Claude Desktop installed, and has Claude Code been used in it?"
     exit 1
 }

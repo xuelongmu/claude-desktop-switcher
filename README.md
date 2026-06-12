@@ -16,6 +16,7 @@ Claude Desktop stores Claude Code chats in two layers:
    | OS | Location |
    |---|---|
    | Windows | `%APPDATA%\Claude\claude-code-sessions\<account-uuid>\<org-uuid>\` |
+   | Windows, packaged app | `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions\<account-uuid>\<org-uuid>\` |
    | macOS | `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/` |
    | Linux | `~/.config/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/` |
 
