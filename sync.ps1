@@ -12,9 +12,11 @@
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
+#   powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts
 
 param(
-    [switch]$List
+    [switch]$List,
+    [switch]$NameAccounts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,7 +157,7 @@ if (-not (Test-Path $StoreDir)) {
 }
 
 # ---------------------------------------------------------------------------
-# Friendly labels (saved per account/org bucket in accounts.conf)
+# Friendly labels (saved per account UUID in accounts.conf)
 # ---------------------------------------------------------------------------
 $Labels = @{}
 if (Test-Path $LabelFile) {
@@ -172,9 +174,75 @@ function Save-Label([string]$key, [string]$value) {
     Set-Content -Path $LabelFile -Value $out -Encoding UTF8
 }
 
+function Get-QuotedFieldValue([string]$text, [int]$startAt, [string]$fieldName) {
+    $fieldIndex = $text.IndexOf($fieldName, $startAt, [StringComparison]::Ordinal)
+    if ($fieldIndex -lt 0) { return $null }
+
+    $quoteIndex = $text.IndexOf('"', $fieldIndex + $fieldName.Length)
+    while ($quoteIndex -ge 0 -and $quoteIndex + 1 -lt $text.Length) {
+        $valueStart = $quoteIndex + 1
+        $valueEnd = $text.IndexOf('"', $valueStart)
+        if ($valueEnd -lt 0) { return $null }
+
+        $value = $text.Substring($valueStart, $valueEnd - $valueStart).Trim()
+        $value = [regex]::Replace($value, '^[^\p{L}\p{N}@]+', '').Trim()
+        if ($value -match '[A-Za-z0-9]') { return $value }
+        $quoteIndex = $text.IndexOf('"', $valueEnd + 1)
+    }
+
+    return $null
+}
+
+function Get-AccountIdentityLabels([string]$userData) {
+    $labels = @{}
+    $indexedDb = Join-Path $userData 'IndexedDB'
+    if (-not (Test-Path $indexedDb)) { return $labels }
+
+    $uuidPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $encoding = [Text.Encoding]::UTF8
+
+    foreach ($file in Get-ChildItem $indexedDb -Recurse -File -ErrorAction SilentlyContinue) {
+        try {
+            $text = $encoding.GetString([IO.File]::ReadAllBytes($file.FullName))
+        } catch {
+            continue
+        }
+
+        foreach ($match in [regex]::Matches($text, $uuidPattern)) {
+            $windowStart = [Math]::Max(0, $match.Index - 500)
+            $windowLength = [Math]::Min(1800, $text.Length - $windowStart)
+            $window = $text.Substring($windowStart, $windowLength)
+            if ($window.IndexOf('email_address', [StringComparison]::Ordinal) -lt 0) { continue }
+
+            $fieldStart = [Math]::Max(0, $match.Index - $windowStart)
+            $emailRaw = Get-QuotedFieldValue $window $fieldStart 'email_address'
+            $emailMatch = if ($emailRaw) { [regex]::Match($emailRaw, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}') } else { $null }
+            if (-not $emailMatch -or -not $emailMatch.Success) { continue }
+            $email = $emailMatch.Value
+
+            $fullName = Get-QuotedFieldValue $window $fieldStart 'full_name'
+            $displayName = Get-QuotedFieldValue $window $fieldStart 'display_name'
+
+            if ($fullName -and $fullName -ne $displayName) {
+                $label = "$fullName <$email>"
+            } elseif ($displayName) {
+                $label = "$displayName <$email>"
+            } else {
+                $label = $email
+            }
+
+            $labels[$match.Value] = $label
+        }
+    }
+
+    return $labels
+}
+
+$AutoLabels = Get-AccountIdentityLabels $UserData
+
 # ---------------------------------------------------------------------------
-# Which account signed in most recently? (best identity signal on disk -
-# the app does not store account emails in plaintext anywhere)
+# Which account signed in most recently? (useful when profile identity is not
+# cached locally for older accounts)
 # ---------------------------------------------------------------------------
 $LastSignedIn = $null
 if (Test-Path $LogFile) {
@@ -235,19 +303,21 @@ if ($Buckets.Count -lt 2) {
 function Get-BucketDisplayName([object]$b) {
     if ($script:Labels.ContainsKey($b.AccountUuid)) { return $script:Labels[$b.AccountUuid] }
     if ($script:Labels.ContainsKey($b.Key)) { return $script:Labels[$b.Key] }
+    if ($script:AutoLabels.ContainsKey($b.AccountUuid)) { return $script:AutoLabels[$b.AccountUuid] }
     return "account $($b.AccountUuid.Substring(0,8))..."
 }
 
 function Get-BucketLabel([object]$b) {
     if ($script:Labels.ContainsKey($b.AccountUuid)) { return $script:Labels[$b.AccountUuid] }
     if ($script:Labels.ContainsKey($b.Key)) { return $script:Labels[$b.Key] }
+    if ($script:AutoLabels.ContainsKey($b.AccountUuid)) { return $script:AutoLabels[$b.AccountUuid] }
     return $null
 }
 
 function Write-BucketList {
     Write-Host ""
     Write-Host "Claude Desktop accounts on this machine" -ForegroundColor Cyan
-    Write-Host "(the app doesn't store emails on disk, so accounts are identified by their chats)" -ForegroundColor DarkGray
+    Write-Host "(cached profiles are named automatically; otherwise accounts are identified by their chats)" -ForegroundColor DarkGray
 
     $i = 0
     foreach ($b in $script:Buckets) {
@@ -278,27 +348,29 @@ function Write-BucketList {
 }
 
 # ---------------------------------------------------------------------------
-# Show and optionally name the accounts
+# Show the accounts and optionally save manual labels
 # ---------------------------------------------------------------------------
 Write-BucketList
 
 if ($List) { exit 0 }
 
-$labelsChanged = $false
-$i = 0
-foreach ($b in $Buckets) {
-    $i++
-    if (-not (Get-BucketLabel $b)) {
-        $name = Read-Host "Name for account [$i] (e.g. 'work', Enter to skip)"
-        if ($name) {
-            Save-Label $b.AccountUuid $name
-            $labelsChanged = $true
+if ($NameAccounts) {
+    $labelsChanged = $false
+    $i = 0
+    foreach ($b in $Buckets) {
+        $i++
+        if (-not (Get-BucketLabel $b)) {
+            $name = Read-Host "Name for account [$i] (e.g. 'work', Enter to skip)"
+            if ($name) {
+                Save-Label $b.AccountUuid $name
+                $labelsChanged = $true
+            }
         }
     }
-}
 
-if ($labelsChanged) {
-    Write-BucketList
+    if ($labelsChanged) {
+        Write-BucketList
+    }
 }
 
 # ---------------------------------------------------------------------------

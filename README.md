@@ -33,6 +33,7 @@ resume normally.
 ```powershell
 powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive sync
 powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
+powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts  # save manual labels
 ```
 
 **macOS / Linux**
@@ -43,11 +44,12 @@ chmod +x sync.sh   # first time only
 ./sync.sh --list   # just list accounts
 ```
 
-The script lists every account that has used Claude Code on this machine,
-identified by a fingerprint — chat count, last activity, most-used projects,
-and recent chat titles — plus a "last signed in" marker. (The app does not
-store account emails on disk anywhere, so it can't show you `dev@...`
-directly.) You can give each account a friendly name; names are remembered in
+The script lists every account that has used Claude Code on this machine. When
+Claude's local web cache still has profile details for an account, the script
+uses that name/email automatically. Otherwise it falls back to a fingerprint:
+chat count, last activity, most-used projects, and recent chat titles, plus a
+"last signed in" marker. If you run with `-NameAccounts`, you can still give
+any unidentified account a friendly name; names are remembered in
 `accounts.conf` next to the script.
 
 Then pick a source and destination, confirm, done. Run it again with the
