@@ -39,18 +39,19 @@ powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts  # save manual l
 **macOS / Linux**
 
 ```bash
-chmod +x sync.sh   # first time only
-./sync.sh          # interactive sync
-./sync.sh --list   # just list accounts
+chmod +x sync.sh           # first time only
+./sync.sh                  # interactive sync
+./sync.sh --list           # just list accounts
+./sync.sh --name-accounts  # save manual labels
 ```
 
 The script lists every account that has used Claude Code on this machine. When
 Claude's local web cache still has profile details for an account, the script
 uses that name/email automatically. Otherwise it falls back to a fingerprint:
 chat count, last activity, most-used projects, and recent chat titles, plus a
-"last signed in" marker. If you run with `-NameAccounts`, you can still give
-any unidentified account a friendly name; names are remembered in
-`accounts.conf` next to the script.
+"last signed in" marker. If you run with `-NameAccounts` (`--name-accounts` on
+macOS/Linux), you can still give any unidentified account a friendly name;
+names are remembered in `accounts.conf` next to the script.
 
 Then pick a source and destination, confirm, done. Run it again with the
 accounts swapped if you want both directions.
@@ -84,7 +85,8 @@ want a safety net, copy the `claude-code-sessions` folder somewhere first.
 If your install keeps its data somewhere non-standard, set `CLAUDE_USER_DATA`
 to the app's data folder before running.
 
-On Windows, `sync.ps1` first checks the known classic and packaged app
-locations above. If neither works, it does a bounded search under the relevant
-AppData roots for a real `claude-code-sessions` store and uses the valid store
-with the most local chat entries.
+Both scripts first check the known install locations above (including the
+Windows packaged app, the macOS sandboxed container, and Linux flatpak/snap
+paths). If none works, they do a bounded search under the relevant app-data
+roots for a real `claude-code-sessions` store and use the valid store with
+the most local chat entries.
