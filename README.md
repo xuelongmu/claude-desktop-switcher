@@ -34,6 +34,7 @@ resume normally.
 powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive sync
 powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
 powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts  # save manual labels
+powershell -ExecutionPolicy Bypass -File sync.ps1 -DryRun  # preview adds/updates
 ```
 
 **macOS / Linux**
@@ -43,6 +44,7 @@ chmod +x sync.sh           # first time only
 ./sync.sh                  # interactive sync
 ./sync.sh --list           # just list accounts
 ./sync.sh --name-accounts  # save manual labels
+./sync.sh --dry-run        # preview adds/updates
 ```
 
 The script lists every account that has used Claude Code on this machine. When
@@ -53,20 +55,25 @@ chat count, last activity, most-used projects, and recent chat titles, plus a
 macOS/Linux), you can still give any unidentified account a friendly name;
 names are remembered in `accounts.conf` next to the script.
 
-Then pick a source and destination, confirm, done. Run it again with the
-accounts swapped if you want both directions.
+Then pick a source and destination, review the planned adds/updates, confirm,
+done. Run it again with the accounts swapped if you want the other account's
+sidebar metadata to become the source of truth.
 
 In the interactive prompt, you can enter source and destination together as
 `1,2` to copy from account 1 to account 2.
 
 ## Sync semantics
 
-- **Additive only.** Copies index entries that are missing at the destination.
-  Never overwrites and never deletes — renames/archives you make at the
-  destination stick.
+- **Source wins for sidebar metadata.** Copies index entries that are missing
+  at the destination and updates existing destination entries when the source
+  JSON differs. This carries over renames, archive state, grouping metadata,
+  and other sidebar fields from the source account.
+- **Dry run.** Use `-DryRun` or `--dry-run` to preview which chats would be
+  added or updated before changing files.
 - **Delete caveat.** If you delete a synced chat in the destination account,
   the next sync re-adds it (the file is "missing" again). Archive instead of
-  delete and this never bites.
+  delete if you want that hidden state to sync as metadata. Destination-only
+  files are never deleted.
 - **Refresh.** The sidebar re-reads its bucket on account switch or app
   restart, not live — switch away and back to see newly synced chats.
 - **MCP approvals.** Each entry records MCP connector approvals from the
@@ -78,9 +85,10 @@ In the interactive prompt, you can enter source and destination together as
 ## Caution
 
 This manipulates Claude Desktop's internal UI metadata, which is unsupported
-behavior — a future app version could change the format. The tool never
-modifies or deletes existing files, so the blast radius is small, but if you
-want a safety net, copy the `claude-code-sessions` folder somewhere first.
+behavior — a future app version could change the format. The tool updates
+destination sidebar JSON files from the selected source, but never deletes
+destination-only files. If you want a safety net, copy the
+`claude-code-sessions` folder somewhere first.
 
 If your install keeps its data somewhere non-standard, set `CLAUDE_USER_DATA`
 to the app's data folder before running.

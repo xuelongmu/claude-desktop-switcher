@@ -6,17 +6,19 @@
 # so making a chat visible to another account only requires copying its small
 # sidebar index entry into that account's bucket.
 #
-# This script is ADDITIVE ONLY: it copies entries that are missing at the
-# destination and never overwrites or deletes anything.
+# This script reconciles from source to destination: it copies missing entries
+# and updates existing entries whose sidebar metadata differs. It never deletes.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts
+#   powershell -ExecutionPolicy Bypass -File sync.ps1 -DryRun  # preview only
 
 param(
     [switch]$List,
-    [switch]$NameAccounts
+    [switch]$NameAccounts,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -417,6 +419,23 @@ function Select-BucketPair {
     }
 }
 
+function Get-ChatTitle([string]$path) {
+    $title = [IO.Path]::GetFileNameWithoutExtension($path)
+    try {
+        $j = Get-Content $path -Raw | ConvertFrom-Json
+        if ($j.title) { $title = $j.title }
+    } catch { }
+    return $title
+}
+
+function Test-SameFileContent([string]$left, [string]$right) {
+    if (-not (Test-Path $left) -or -not (Test-Path $right)) { return $false }
+    $leftInfo = Get-Item $left
+    $rightInfo = Get-Item $right
+    if ($leftInfo.Length -ne $rightInfo.Length) { return $false }
+    return (Get-FileHash $left -Algorithm SHA256).Hash -eq (Get-FileHash $right -Algorithm SHA256).Hash
+}
+
 $selection = Select-BucketPair
 $srcIdx = $selection.Source
 $dstIdx = $selection.Destination
@@ -427,14 +446,47 @@ $dst = $Buckets[$dstIdx - 1]
 # Plan and confirm
 # ---------------------------------------------------------------------------
 $srcFiles = @(Get-ChildItem $src.Path -Filter 'local_*.json' -File)
-$toCopy = @($srcFiles | Where-Object { -not (Test-Path (Join-Path $dst.Path $_.Name)) })
+$actions = @()
+foreach ($f in $srcFiles) {
+    $destPath = Join-Path $dst.Path $f.Name
+    if (-not (Test-Path $destPath)) {
+        $actions += [pscustomobject]@{
+            Action = 'add'
+            Source = $f.FullName
+            Destination = $destPath
+            Title = Get-ChatTitle $f.FullName
+        }
+    } elseif (-not (Test-SameFileContent $f.FullName $destPath)) {
+        $actions += [pscustomobject]@{
+            Action = 'update'
+            Source = $f.FullName
+            Destination = $destPath
+            Title = Get-ChatTitle $f.FullName
+        }
+    }
+}
+
+$toAdd = @($actions | Where-Object { $_.Action -eq 'add' })
+$toUpdate = @($actions | Where-Object { $_.Action -eq 'update' })
+$unchanged = $srcFiles.Count - $actions.Count
 
 Write-Host ""
-Write-Host ("{0} chats at source; {1} already present at destination; {2} to copy." -f `
-    $srcFiles.Count, ($srcFiles.Count - $toCopy.Count), $toCopy.Count)
+Write-Host ("{0} chats at source; {1} unchanged at destination; {2} to add; {3} to update." -f `
+    $srcFiles.Count, $unchanged, $toAdd.Count, $toUpdate.Count)
 
-if ($toCopy.Count -eq 0) {
+if ($actions.Count -eq 0) {
     Write-Host "Nothing to do - '$(Get-BucketDisplayName $dst)' is already up to date." -ForegroundColor Green
+    exit 0
+}
+
+foreach ($a in $actions) {
+    $prefix = if ($a.Action -eq 'add') { '+' } else { '~' }
+    Write-Host ("  {0} {1}" -f $prefix, $a.Title) -ForegroundColor $(if ($a.Action -eq 'add') { 'Green' } else { 'Cyan' })
+}
+
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "Dry run only - no files were changed." -ForegroundColor Yellow
     exit 0
 }
 
@@ -444,28 +496,29 @@ if ($claudeProc) {
     Write-Host "re-reads this folder on account switch or app restart." -ForegroundColor Yellow
 }
 
-$confirm = Read-Host "Copy $($toCopy.Count) chat(s) from '$(Get-BucketDisplayName $src)' to '$(Get-BucketDisplayName $dst)'? [y/N]"
+$confirm = Read-Host "Apply $($toAdd.Count) add(s) and $($toUpdate.Count) update(s) from '$(Get-BucketDisplayName $src)' to '$(Get-BucketDisplayName $dst)'? [y/N]"
 if ($confirm -notmatch '^[yY]') {
-    Write-Host "Aborted - nothing was copied."
+    Write-Host "Aborted - nothing was changed."
     exit 0
 }
 
 # ---------------------------------------------------------------------------
-# Copy (additive: only files missing at the destination)
+# Copy/update from source to destination. Destination-only files are left alone.
 # ---------------------------------------------------------------------------
-$copied = 0
-foreach ($f in $toCopy) {
-    $title = $f.BaseName
-    try {
-        $j = Get-Content $f.FullName -Raw | ConvertFrom-Json
-        if ($j.title) { $title = $j.title }
-    } catch { }
-    Copy-Item $f.FullName (Join-Path $dst.Path $f.Name)
-    $copied++
-    Write-Host ("  + {0}" -f $title) -ForegroundColor Green
+$added = 0
+$updated = 0
+foreach ($a in $actions) {
+    Copy-Item $a.Source $a.Destination -Force
+    if ($a.Action -eq 'add') {
+        $added++
+        Write-Host ("  + {0}" -f $a.Title) -ForegroundColor Green
+    } else {
+        $updated++
+        Write-Host ("  ~ {0}" -f $a.Title) -ForegroundColor Cyan
+    }
 }
 
 Write-Host ""
-Write-Host "Copied $copied chat(s). Switch to that account (or restart Claude Desktop) to see them." -ForegroundColor Green
-Write-Host "Tip: archive synced chats you don't want instead of deleting them -"
-Write-Host "deleted ones reappear on the next sync, archived ones stay hidden."
+Write-Host "Applied $added add(s) and $updated update(s). Switch to that account (or restart Claude Desktop) to see them." -ForegroundColor Green
+Write-Host "Tip: destination-only chats are left alone. Archive state and renames follow"
+Write-Host "the source account when its sidebar JSON is updated."

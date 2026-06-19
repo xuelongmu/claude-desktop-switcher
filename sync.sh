@@ -7,13 +7,14 @@
 # accounts, so making a chat visible to another account only requires copying
 # its small sidebar index entry into that account's bucket.
 #
-# This script is ADDITIVE ONLY: it copies entries that are missing at the
-# destination and never overwrites or deletes anything.
+# This script reconciles from source to destination: it copies missing entries
+# and updates existing entries whose sidebar metadata differs. It never deletes.
 #
 # Usage:
 #   ./sync.sh                  # interactive
 #   ./sync.sh --list           # just list accounts
 #   ./sync.sh --name-accounts  # save manual labels for unnamed accounts
+#   ./sync.sh --dry-run        # preview only
 #
 # Compatible with bash 3.2 (stock macOS). Uses jq or python3 for chat titles
 # and python3 for auto-labels from Claude's local web cache; degrades
@@ -23,13 +24,15 @@ set -u
 
 LIST_ONLY=0
 NAME_ACCOUNTS=0
+DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --list) LIST_ONLY=1 ;;
     --name-accounts) NAME_ACCOUNTS=1 ;;
+    --dry-run) DRY_RUN=1 ;;
     *)
       echo "Unknown option: $arg" >&2
-      echo "Usage: $0 [--list] [--name-accounts]" >&2
+      echo "Usage: $0 [--list] [--name-accounts] [--dry-run]" >&2
       exit 1
       ;;
   esac
@@ -563,22 +566,43 @@ DST_PATH="${B_PATH[$dst_i]}"
 # ---------------------------------------------------------------------------
 # Plan and confirm
 # ---------------------------------------------------------------------------
-src_total=0; to_copy=0; COPY_LIST=""
+src_total=0; to_add=0; to_update=0; ADD_LIST=""; UPDATE_LIST=""
 for f in "$SRC_PATH"local_*.json; do
   [ -e "$f" ] || continue
   src_total=$((src_total + 1))
   base="$(basename "$f")"
   if [ ! -e "$DST_PATH$base" ]; then
-    to_copy=$((to_copy + 1))
-    COPY_LIST="$COPY_LIST$base\n"
+    to_add=$((to_add + 1))
+    ADD_LIST="$ADD_LIST$base\n"
+  elif ! cmp -s "$f" "$DST_PATH$base"; then
+    to_update=$((to_update + 1))
+    UPDATE_LIST="$UPDATE_LIST$base\n"
   fi
 done
+unchanged=$((src_total - to_add - to_update))
 
 echo ""
-echo "$src_total chats at source; $((src_total - to_copy)) already present at destination; $to_copy to copy."
+echo "$src_total chats at source; $unchanged unchanged at destination; $to_add to add; $to_update to update."
 
-if [ "$to_copy" -eq 0 ]; then
+if [ "$to_add" -eq 0 ] && [ "$to_update" -eq 0 ]; then
   echo "Nothing to do - '$(display_name "$dst_i")' is already up to date."
+  exit 0
+fi
+
+printf '%b' "$ADD_LIST" | while read -r base; do
+  [ -n "$base" ] || continue
+  title="$(json_get title "$SRC_PATH$base")"
+  echo "  + ${title:-${base%.json}}"
+done
+printf '%b' "$UPDATE_LIST" | while read -r base; do
+  [ -n "$base" ] || continue
+  title="$(json_get title "$SRC_PATH$base")"
+  echo "  ~ ${title:-${base%.json}}"
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo ""
+  echo "Dry run only - no files were changed."
   exit 0
 fi
 
@@ -587,27 +611,30 @@ if pgrep -x "Claude" >/dev/null 2>&1 || pgrep -x "claude-desktop" >/dev/null 2>&
   echo "re-reads this folder on account switch or app restart."
 fi
 
-printf "Copy %s chat(s) from '%s' to '%s'? [y/N] " "$to_copy" "$(display_name "$src_i")" "$(display_name "$dst_i")"
+printf "Apply %s add(s) and %s update(s) from '%s' to '%s'? [y/N] " "$to_add" "$to_update" "$(display_name "$src_i")" "$(display_name "$dst_i")"
 read -r confirm || exit 1
 case "$confirm" in
   y*|Y*) ;;
-  *) echo "Aborted - nothing was copied."; exit 0 ;;
+  *) echo "Aborted - nothing was changed."; exit 0 ;;
 esac
 
 # ---------------------------------------------------------------------------
-# Copy (additive: only files missing at the destination)
+# Copy/update from source to destination. Destination-only files are left alone.
 # ---------------------------------------------------------------------------
-copied=0
-printf '%b' "$COPY_LIST" | while read -r base; do
+printf '%b' "$ADD_LIST" | while read -r base; do
   [ -n "$base" ] || continue
   title="$(json_get title "$SRC_PATH$base")"
   cp "$SRC_PATH$base" "$DST_PATH$base"
   echo "  + ${title:-${base%.json}}"
 done
-# (the while runs in a subshell; recount for the summary)
-copied="$to_copy"
+printf '%b' "$UPDATE_LIST" | while read -r base; do
+  [ -n "$base" ] || continue
+  title="$(json_get title "$SRC_PATH$base")"
+  cp "$SRC_PATH$base" "$DST_PATH$base"
+  echo "  ~ ${title:-${base%.json}}"
+done
 
 echo ""
-echo "Copied $copied chat(s). Switch to that account (or restart Claude Desktop) to see them."
-echo "Tip: archive synced chats you don't want instead of deleting them -"
-echo "deleted ones reappear on the next sync, archived ones stay hidden."
+echo "Applied $to_add add(s) and $to_update update(s). Switch to that account (or restart Claude Desktop) to see them."
+echo "Tip: destination-only chats are left alone. Archive state and renames follow"
+echo "the source account when its sidebar JSON is updated."
