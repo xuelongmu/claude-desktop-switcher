@@ -34,6 +34,7 @@ resume normally.
 powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive sync
 powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
 powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts  # save manual labels
+powershell -ExecutionPolicy Bypass -File sync.ps1 -Unarchive  # restore archived chats
 powershell -ExecutionPolicy Bypass -File sync.ps1 -DryRun  # preview adds/updates
 ```
 
@@ -44,6 +45,7 @@ chmod +x sync.sh           # first time only
 ./sync.sh                  # interactive sync
 ./sync.sh --list           # just list accounts
 ./sync.sh --name-accounts  # save manual labels
+./sync.sh --unarchive      # restore archived chats
 ./sync.sh --dry-run        # preview adds/updates
 ```
 
@@ -81,6 +83,32 @@ In the interactive prompt, you can enter source and destination together as
   don't exist; the chat works fine, but tool approvals may be re-prompted.
 - **Local chats only.** Cloud/remote sessions are listed server-side per
   account and can't be ported this way.
+
+## Restoring archived chats
+
+Archiving a chat in Claude Desktop hides it from the main list but keeps the
+sidebar entry on disk with an `"isArchived": true` flag. `-Unarchive`
+(`--unarchive` on macOS/Linux) flips selected chats back to active so they
+reappear in the chat window.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File sync.ps1 -Unarchive
+```
+
+It picks one account (auto-selected if there's only one, otherwise you choose),
+lists that account's archived chats **grouped by project** (e.g. `winwood`,
+`zerogen-playground`), and lets you restore all of them or a subset
+(e.g. `1,3,5`). Projects are ordered by their most recent chat, and the
+numbering runs straight through the groups so a single index still selects a
+chat. Add `-DryRun` / `--dry-run` to preview without writing.
+
+- **Surgical edit.** Only the one `isArchived` flag is flipped; the rest of the
+  sidebar JSON is left byte-for-byte unchanged (no reserialize, no BOM, no added
+  newline), so nothing else about the chat is disturbed.
+- **Per account.** Archive state is stored per account, so unarchiving acts on
+  the account you pick. Run it again for another account if needed.
+- **Refresh.** Like sync, the sidebar re-reads its bucket on account switch or
+  app restart — switch away and back to see restored chats.
 
 ## Caution
 
