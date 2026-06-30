@@ -481,12 +481,20 @@ function Get-ArchivedSessions([string]$bucketPath) {
 }
 
 function Restore-Session([string]$path) {
-    $raw = [System.IO.File]::ReadAllText($path, $script:Utf8NoBom)
-    $re = [regex]'("isArchived"\s*:\s*)true'
-    $new = $re.Replace($raw, '${1}false', 1)
-    if ($new -eq $raw) { return $false }
-    [System.IO.File]::WriteAllText($path, $new, $script:Utf8NoBom)
-    return $true
+    # ReadAllText/WriteAllText do no newline translation, so the file is
+    # preserved byte-for-byte apart from the flag. Returns $false on any
+    # failure (e.g. a locked or read-only store file) so the caller never
+    # reports an unchanged file as restored.
+    try {
+        $raw = [System.IO.File]::ReadAllText($path, $script:Utf8NoBom)
+        $re = [regex]'("isArchived"\s*:\s*)true'
+        $new = $re.Replace($raw, '${1}false', 1)
+        if ($new -eq $raw) { return $false }
+        [System.IO.File]::WriteAllText($path, $new, $script:Utf8NoBom)
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Select-IndexSubset([int]$count, [string]$promptText) {
@@ -576,14 +584,24 @@ if ($Unarchive) {
     }
 
     $restored = 0
+    $failed = 0
     foreach ($n in $selected) {
-        if (Restore-Session $ordered[$n - 1].Path) {
+        $entry = $ordered[$n - 1]
+        if (Restore-Session $entry.Path) {
             $restored++
-            Write-Host ("  ^ {0}: {1}" -f $ordered[$n - 1].Project, $ordered[$n - 1].Title) -ForegroundColor Green
+            Write-Host ("  ^ {0}: {1}" -f $entry.Project, $entry.Title) -ForegroundColor Green
+        } else {
+            $failed++
+            Write-Host ("  ! FAILED (file locked or unwritable?): {0}: {1}" -f $entry.Project, $entry.Title) -ForegroundColor Red
         }
     }
 
     Write-Host ""
+    if ($failed -gt 0) {
+        Write-Host "Restored $restored chat(s); $failed could not be changed (left archived)." -ForegroundColor Yellow
+        Write-Host "Switch to that account (or restart Claude Desktop) to see the restored ones."
+        exit 1
+    }
     Write-Host "Restored $restored chat(s). Switch to that account (or restart Claude Desktop) to see them in the active list." -ForegroundColor Green
     exit 0
 }

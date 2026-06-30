@@ -268,22 +268,31 @@ is_archived() { # $1=file -> exit 0 if the sidebar entry is archived
   grep -qE '"isArchived"[[:space:]]*:[[:space:]]*true' "$1" 2>/dev/null
 }
 
-unarchive_file() { # $1=file -> flip "isArchived":true to false in place
+unarchive_file() { # $1=file -> 0 if the flag was flipped on disk, non-zero otherwise
   local f="$1"
   if [ "$PY_OK" -eq 1 ]; then
+    # Read/write in binary so CRLF line endings (e.g. a Windows store shared
+    # via CLAUDE_USER_DATA) survive untouched; exit non-zero if nothing changed.
     python3 -c 'import re,sys
 p = sys.argv[1]
-s = open(p, encoding="utf-8").read()
-s2 = re.sub(r"(\"isArchived\"\s*:\s*)true", r"\1false", s, count=1)
-if s2 != s:
-    open(p, "w", encoding="utf-8", newline="").write(s2)' "$f"
+with open(p, "rb") as fh:
+    data = fh.read()
+new = re.sub(rb"(\"isArchived\"\s*:\s*)true", rb"\1false", data, count=1)
+if new == data:
+    sys.exit(2)
+with open(p, "wb") as fh:
+    fh.write(new)' "$f" || return 1
   elif command -v perl >/dev/null 2>&1; then
-    perl -0777 -i -pe 's/("isArchived"\s*:\s*)true/${1}false/' "$f"
+    perl -0777 -i -pe 's/("isArchived"\s*:\s*)true/${1}false/' "$f" || return 1
   else
     # sed fallback: the entry is one minified line with a single occurrence.
     sed 's/"isArchived"[[:space:]]*:[[:space:]]*true/"isArchived":false/' "$f" > "$f.tmp" \
-      && mv "$f.tmp" "$f"
+      && mv "$f.tmp" "$f" || { rm -f "$f.tmp" 2>/dev/null; return 1; }
   fi
+  # Confirm the change actually landed (e.g. a locked/read-only file can leave
+  # the original archived even when the tool above reports success).
+  if is_archived "$f"; then return 1; fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -720,14 +729,24 @@ if [ "$UNARCHIVE" -eq 1 ]; then
   esac
 
   restored=0
+  failed=0
   for n in $SEL_IDX; do
     oi="${DISP[$n]}"
-    unarchive_file "${ARCH_FILES[$oi]}"
-    restored=$((restored + 1))
-    echo "  ^ ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+    if unarchive_file "${ARCH_FILES[$oi]}"; then
+      restored=$((restored + 1))
+      echo "  ^ ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+    else
+      failed=$((failed + 1))
+      echo "  ! FAILED (file locked or unwritable?): ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+    fi
   done
 
   echo ""
+  if [ "$failed" -gt 0 ]; then
+    echo "Restored $restored chat(s); $failed could not be changed (left archived)."
+    echo "Switch to that account (or restart Claude Desktop) to see the restored ones."
+    exit 1
+  fi
   echo "Restored $restored chat(s). Switch to that account (or restart Claude Desktop) to see them in the active list."
   exit 0
 fi
