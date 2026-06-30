@@ -9,15 +9,20 @@
 # This script reconciles from source to destination: it copies missing entries
 # and updates existing entries whose sidebar metadata differs. It never deletes.
 #
+# It can also restore archived chats: -Unarchive flips an account's archived
+# sidebar entries back to active so they reappear in the main chat list.
+#
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File sync.ps1          # interactive
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -List    # just list accounts
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -NameAccounts
+#   powershell -ExecutionPolicy Bypass -File sync.ps1 -Unarchive  # restore archived chats
 #   powershell -ExecutionPolicy Bypass -File sync.ps1 -DryRun  # preview only
 
 param(
     [switch]$List,
     [switch]$NameAccounts,
+    [switch]$Unarchive,
     [switch]$DryRun
 )
 
@@ -296,9 +301,14 @@ foreach ($accDir in Get-ChildItem $StoreDir -Directory) {
     }
 }
 
-if ($Buckets.Count -lt 2) {
+$MinBuckets = if ($Unarchive) { 1 } else { 2 }
+if ($Buckets.Count -lt $MinBuckets) {
     Write-Host "Found $($Buckets.Count) account bucket(s) in $StoreDir." -ForegroundColor Yellow
-    Write-Host "Syncing needs at least two accounts that have used Claude Code in the desktop app."
+    if ($Unarchive) {
+        Write-Host "Unarchiving needs at least one account that has used Claude Code in the desktop app."
+    } else {
+        Write-Host "Syncing needs at least two accounts that have used Claude Code in the desktop app."
+    }
     exit 1
 }
 
@@ -434,6 +444,166 @@ function Test-SameFileContent([string]$left, [string]$right) {
     $rightInfo = Get-Item $right
     if ($leftInfo.Length -ne $rightInfo.Length) { return $false }
     return (Get-FileHash $left -Algorithm SHA256).Hash -eq (Get-FileHash $right -Algorithm SHA256).Hash
+}
+
+# ---------------------------------------------------------------------------
+# Unarchive: restore archived chats into the active list for one account.
+# Archive state lives in a single top-level "isArchived" flag in each sidebar
+# entry; flipping it to false (preserving the rest of the file byte-for-byte)
+# moves the chat back into the main list. Detection reads the raw text so a
+# deeply nested entry that fails JSON parsing is never silently skipped.
+# ---------------------------------------------------------------------------
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Get-ArchivedSessions([string]$bucketPath) {
+    $result = @()
+    foreach ($f in Get-ChildItem $bucketPath -Filter 'local_*.json' -File -ErrorAction SilentlyContinue) {
+        try { $raw = [System.IO.File]::ReadAllText($f.FullName, $script:Utf8NoBom) } catch { continue }
+        if ($raw -notmatch '"isArchived"\s*:\s*true') { continue }
+        $title = $null
+        $project = $null
+        try {
+            $j = $raw | ConvertFrom-Json
+            $title = $j.title
+            if ($j.originCwd) { $project = Split-Path $j.originCwd -Leaf }
+            elseif ($j.cwd)   { $project = Split-Path $j.cwd -Leaf }
+        } catch { }
+        if (-not $title)   { $title = [IO.Path]::GetFileNameWithoutExtension($f.Name) }
+        if (-not $project) { $project = '(no project)' }
+        $result += [pscustomobject]@{
+            Path       = $f.FullName
+            Title      = $title
+            Project    = $project
+            LastActive = $f.LastWriteTime
+        }
+    }
+    return @($result)
+}
+
+function Restore-Session([string]$path) {
+    # ReadAllText/WriteAllText do no newline translation, so the file is
+    # preserved byte-for-byte apart from the flag. Returns $false on any
+    # failure (e.g. a locked or read-only store file) so the caller never
+    # reports an unchanged file as restored.
+    try {
+        $raw = [System.IO.File]::ReadAllText($path, $script:Utf8NoBom)
+        $re = [regex]'("isArchived"\s*:\s*)true'
+        $new = $re.Replace($raw, '${1}false', 1)
+        if ($new -eq $raw) { return $false }
+        [System.IO.File]::WriteAllText($path, $new, $script:Utf8NoBom)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Select-IndexSubset([int]$count, [string]$promptText) {
+    while ($true) {
+        $raw = Read-Host $promptText
+        if (-not $raw) { return @() }                       # Enter = cancel
+        if ($raw -match '^\s*(all|a)\s*$') { return @(1..$count) }
+        $nums = @([regex]::Matches($raw, '\d+') | ForEach-Object { [int]$_.Value })
+        $uniqueEntered = @($nums | Sort-Object -Unique)
+        $valid = @($uniqueEntered | Where-Object { $_ -ge 1 -and $_ -le $count })
+        if ($nums.Count -gt 0 -and $valid.Count -eq $uniqueEntered.Count) { return $valid }
+        Write-Host "Enter numbers from 1 to $count, 'all', or Enter to cancel." -ForegroundColor Yellow
+    }
+}
+
+if ($Unarchive) {
+    if ($Buckets.Count -eq 1) {
+        $acctIdx = 1
+    } else {
+        $acctIdx = Select-Bucket "Restore archived chats IN which account #" 0
+    }
+    $acct = $Buckets[$acctIdx - 1]
+
+    $archived = @(Get-ArchivedSessions $acct.Path)
+    if ($archived.Count -eq 0) {
+        Write-Host ""
+        Write-Host "No archived chats in '$(Get-BucketDisplayName $acct)'." -ForegroundColor Green
+        exit 0
+    }
+
+    # Group by project: projects ordered by their most recent chat (newest
+    # first), and chats within a project newest first. The numbering runs
+    # straight through the grouped order so a single index still selects a chat.
+    $projectGroups = $archived | Group-Object Project | Sort-Object `
+        @{ Expression = { ($_.Group.LastActive | Sort-Object -Descending | Select-Object -First 1) }; Descending = $true }, `
+        @{ Expression = { $_.Name }; Descending = $false }
+    $ordered = @()
+    foreach ($grp in $projectGroups) {
+        $ordered += @($grp.Group | Sort-Object LastActive -Descending)
+    }
+
+    Write-Host ""
+    Write-Host ("Archived chats in '{0}', by project:" -f (Get-BucketDisplayName $acct)) -ForegroundColor Cyan
+    $i = 0
+    $lastProject = $null
+    foreach ($a in $ordered) {
+        if ($a.Project -ne $lastProject) {
+            Write-Host ""
+            Write-Host ("  {0}" -f $a.Project) -ForegroundColor White
+            $lastProject = $a.Project
+        }
+        $i++
+        $when = if ($a.LastActive) { "{0:yyyy-MM-dd}" -f $a.LastActive } else { "" }
+        Write-Host ("    [{0}] {1}" -f $i, $a.Title) -NoNewline
+        if ($when) { Write-Host ("   ({0})" -f $when) -ForegroundColor DarkGray } else { Write-Host "" }
+    }
+    Write-Host ""
+
+    $selected = @(Select-IndexSubset $ordered.Count "Restore which? (e.g. 1,3,5; 'all'; Enter to cancel)")
+    if ($selected.Count -eq 0) {
+        Write-Host "Cancelled - nothing was changed."
+        exit 0
+    }
+
+    Write-Host ""
+    Write-Host ("Will restore {0} chat(s) to the active list:" -f $selected.Count)
+    foreach ($n in $selected) {
+        Write-Host ("  ^ {0}: {1}" -f $ordered[$n - 1].Project, $ordered[$n - 1].Title) -ForegroundColor Green
+    }
+
+    if ($DryRun) {
+        Write-Host ""
+        Write-Host "Dry run only - no files were changed." -ForegroundColor Yellow
+        exit 0
+    }
+
+    $claudeProc = Get-Process -Name 'Claude' -ErrorAction SilentlyContinue
+    if ($claudeProc) {
+        Write-Host "Note: Claude Desktop is running. Editing is safe, but the sidebar only" -ForegroundColor Yellow
+        Write-Host "re-reads this folder on account switch or app restart." -ForegroundColor Yellow
+    }
+
+    $confirm = Read-Host ("Restore {0} chat(s) in '{1}'? [y/N]" -f $selected.Count, (Get-BucketDisplayName $acct))
+    if ($confirm -notmatch '^[yY]') {
+        Write-Host "Aborted - nothing was changed."
+        exit 0
+    }
+
+    $restored = 0
+    $failed = 0
+    foreach ($n in $selected) {
+        $entry = $ordered[$n - 1]
+        if (Restore-Session $entry.Path) {
+            $restored++
+            Write-Host ("  ^ {0}: {1}" -f $entry.Project, $entry.Title) -ForegroundColor Green
+        } else {
+            $failed++
+            Write-Host ("  ! FAILED (file locked or unwritable?): {0}: {1}" -f $entry.Project, $entry.Title) -ForegroundColor Red
+        }
+    }
+
+    Write-Host ""
+    if ($failed -gt 0) {
+        Write-Host "Restored $restored chat(s); $failed could not be changed (left archived)." -ForegroundColor Yellow
+        Write-Host "Switch to that account (or restart Claude Desktop) to see the restored ones."
+        exit 1
+    }
+    Write-Host "Restored $restored chat(s). Switch to that account (or restart Claude Desktop) to see them in the active list." -ForegroundColor Green
+    exit 0
 }
 
 $selection = Select-BucketPair

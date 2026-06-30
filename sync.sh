@@ -10,10 +10,14 @@
 # This script reconciles from source to destination: it copies missing entries
 # and updates existing entries whose sidebar metadata differs. It never deletes.
 #
+# It can also restore archived chats: --unarchive flips an account's archived
+# sidebar entries back to active so they reappear in the main chat list.
+#
 # Usage:
 #   ./sync.sh                  # interactive
 #   ./sync.sh --list           # just list accounts
 #   ./sync.sh --name-accounts  # save manual labels for unnamed accounts
+#   ./sync.sh --unarchive      # restore archived chats
 #   ./sync.sh --dry-run        # preview only
 #
 # Compatible with bash 3.2 (stock macOS). Uses jq or python3 for chat titles
@@ -24,15 +28,17 @@ set -u
 
 LIST_ONLY=0
 NAME_ACCOUNTS=0
+UNARCHIVE=0
 DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --list) LIST_ONLY=1 ;;
     --name-accounts) NAME_ACCOUNTS=1 ;;
+    --unarchive) UNARCHIVE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     *)
       echo "Unknown option: $arg" >&2
-      echo "Usage: $0 [--list] [--name-accounts] [--dry-run]" >&2
+      echo "Usage: $0 [--list] [--name-accounts] [--unarchive] [--dry-run]" >&2
       exit 1
       ;;
   esac
@@ -252,6 +258,44 @@ except Exception:
 }
 
 # ---------------------------------------------------------------------------
+# Archive helpers. Archive state lives in a single top-level "isArchived" flag
+# in each sidebar entry. Detection greps the raw token (it appears exactly once
+# per file and needs no JSON tool); restoring flips that one true to false while
+# preserving the rest of the file byte-for-byte (no reserialize, no BOM, no
+# added newline).
+# ---------------------------------------------------------------------------
+is_archived() { # $1=file -> exit 0 if the sidebar entry is archived
+  grep -qE '"isArchived"[[:space:]]*:[[:space:]]*true' "$1" 2>/dev/null
+}
+
+unarchive_file() { # $1=file -> 0 if the flag was flipped on disk, non-zero otherwise
+  local f="$1"
+  if [ "$PY_OK" -eq 1 ]; then
+    # Read/write in binary so CRLF line endings (e.g. a Windows store shared
+    # via CLAUDE_USER_DATA) survive untouched; exit non-zero if nothing changed.
+    python3 -c 'import re,sys
+p = sys.argv[1]
+with open(p, "rb") as fh:
+    data = fh.read()
+new = re.sub(rb"(\"isArchived\"\s*:\s*)true", rb"\1false", data, count=1)
+if new == data:
+    sys.exit(2)
+with open(p, "wb") as fh:
+    fh.write(new)' "$f" || return 1
+  elif command -v perl >/dev/null 2>&1; then
+    perl -0777 -i -pe 's/("isArchived"\s*:\s*)true/${1}false/' "$f" || return 1
+  else
+    # sed fallback: the entry is one minified line with a single occurrence.
+    sed 's/"isArchived"[[:space:]]*:[[:space:]]*true/"isArchived":false/' "$f" > "$f.tmp" \
+      && mv "$f.tmp" "$f" || { rm -f "$f.tmp" 2>/dev/null; return 1; }
+  fi
+  # Confirm the change actually landed (e.g. a locked/read-only file can leave
+  # the original archived even when the tool above reports success).
+  if is_archived "$f"; then return 1; fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Friendly labels (saved per account UUID in accounts.conf)
 # ---------------------------------------------------------------------------
 conf_get() { # $1=key
@@ -408,9 +452,15 @@ for accdir in "$STORE"/*/; do
 done
 
 NBUCKETS=${#B_KEY[@]}
-if [ "$NBUCKETS" -lt 2 ]; then
+MIN_BUCKETS=2
+[ "$UNARCHIVE" -eq 1 ] && MIN_BUCKETS=1
+if [ "$NBUCKETS" -lt "$MIN_BUCKETS" ]; then
   echo "Found $NBUCKETS account bucket(s) in $STORE." >&2
-  echo "Syncing needs at least two accounts that have used Claude Code in the desktop app." >&2
+  if [ "$UNARCHIVE" -eq 1 ]; then
+    echo "Unarchiving needs at least one account that has used Claude Code in the desktop app." >&2
+  else
+    echo "Syncing needs at least two accounts that have used Claude Code in the desktop app." >&2
+  fi
   exit 1
 fi
 
@@ -556,6 +606,150 @@ select_pair() { # sets SRC_N and DST_N
     return 0
   done
 }
+
+# ---------------------------------------------------------------------------
+# Unarchive mode: restore archived chats into the active list for one account.
+# ---------------------------------------------------------------------------
+if [ "$UNARCHIVE" -eq 1 ]; then
+  if [ "$NBUCKETS" -eq 1 ]; then
+    acc_i=0
+  else
+    select_bucket "Restore archived chats IN account #: " 0
+    acc_i=$((SELECTED - 1))
+  fi
+  acc_path="${B_PATH[$acc_i]}"
+
+  ARCH_FILES=(); ARCH_TITLES=(); ARCH_PROJ=(); ARCH_EPOCH=()
+  for f in "$acc_path"local_*.json; do
+    [ -e "$f" ] || continue
+    is_archived "$f" || continue
+    t="$(json_get title "$f")"
+    [ -n "$t" ] || t="$(basename "$f" .json)"
+    p="$(json_get originCwd "$f")"
+    [ -n "$p" ] || p="$(json_get cwd "$f")"
+    if [ -n "$p" ]; then proj="$(basename "$p")"; else proj="(no project)"; fi
+    ARCH_FILES[${#ARCH_FILES[@]}]="$f"
+    ARCH_TITLES[${#ARCH_TITLES[@]}]="$t"
+    ARCH_PROJ[${#ARCH_PROJ[@]}]="$proj"
+    ARCH_EPOCH[${#ARCH_EPOCH[@]}]="$(file_mtime "$f")"
+  done
+
+  narch=${#ARCH_FILES[@]}
+  if [ "$narch" -eq 0 ]; then
+    echo ""
+    echo "No archived chats in '$(display_name "$acc_i")'."
+    exit 0
+  fi
+
+  # Order grouped by project: projects by their most recent chat (newest
+  # first, tie-broken by name), chats within a project newest first. awk
+  # buffers each entry, stamps it with its project's max epoch, then sort
+  # arranges the lot; the trailing field is the original 0-based index.
+  arch_lines="$(k=0; while [ "$k" -lt "$narch" ]; do
+      printf '%s\t%s\t%s\n' "${ARCH_PROJ[$k]}" "${ARCH_EPOCH[$k]}" "$k"
+      k=$((k + 1))
+    done)"
+  ordered_idx="$(printf '%s\n' "$arch_lines" | awk -F'\t' '
+      { proj[NR]=$1; ep[NR]=$2; idx[NR]=$3; if ($2 > m[$1]) m[$1]=$2 }
+      END { for (r=1; r<=NR; r++) printf "%s\t%s\t%s\t%s\n", m[proj[r]], proj[r], ep[r], idx[r] }
+    ' | sort -t"$(printf '\t')" -k1,1nr -k2,2 -k3,3nr | awk -F'\t' '{print $4}')"
+
+  # Render grouped, numbering straight through, and map each display number to
+  # its original index so a single index still selects the right chat.
+  DISP=()
+  echo ""
+  echo "Archived chats in '$(display_name "$acc_i")', by project:"
+  last_proj=""
+  dn=0
+  for di in $ordered_idx; do
+    if [ "${ARCH_PROJ[$di]}" != "$last_proj" ]; then
+      echo ""
+      echo "  ${ARCH_PROJ[$di]}"
+      last_proj="${ARCH_PROJ[$di]}"
+    fi
+    dn=$((dn + 1))
+    DISP[$dn]="$di"
+    echo "    [$dn] ${ARCH_TITLES[$di]}   ($(fmt_epoch "${ARCH_EPOCH[$di]}"))"
+  done
+  echo ""
+
+  SEL_IDX=""
+  while :; do
+    printf "Restore which? (e.g. 1,3,5; 'all'; Enter to cancel): "
+    read -r raw || exit 1
+    if [ -z "$raw" ]; then
+      echo "Cancelled - nothing was changed."
+      exit 0
+    fi
+    case "$raw" in
+      all|ALL|a|A)
+        SEL_IDX="$(i=1; while [ "$i" -le "$narch" ]; do echo "$i"; i=$((i + 1)); done)"
+        break
+        ;;
+      *)
+        nums="$(printf '%s\n' "$raw" | grep -oE '[0-9]+' || true)"
+        bad=0
+        for x in $nums; do
+          if [ "$x" -lt 1 ] || [ "$x" -gt "$narch" ]; then bad=1; fi
+        done
+        if [ -z "$nums" ] || [ "$bad" -eq 1 ]; then
+          echo "Enter numbers from 1 to $narch, 'all', or Enter to cancel."
+          continue
+        fi
+        SEL_IDX="$(printf '%s\n' "$nums" | sort -n | uniq)"
+        break
+        ;;
+    esac
+  done
+
+  sel_count="$(printf '%s\n' "$SEL_IDX" | grep -c . | tr -d ' ')"
+  echo ""
+  echo "Will restore $sel_count chat(s) to the active list:"
+  for n in $SEL_IDX; do
+    oi="${DISP[$n]}"
+    echo "  ^ ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+  done
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo ""
+    echo "Dry run only - no files were changed."
+    exit 0
+  fi
+
+  if pgrep -x "Claude" >/dev/null 2>&1 || pgrep -x "claude-desktop" >/dev/null 2>&1 || pgrep -x "claude" >/dev/null 2>&1; then
+    echo "Note: Claude Desktop is running. Editing is safe, but the sidebar only"
+    echo "re-reads this folder on account switch or app restart."
+  fi
+
+  printf "Restore %s chat(s) in '%s'? [y/N] " "$sel_count" "$(display_name "$acc_i")"
+  read -r confirm || exit 1
+  case "$confirm" in
+    y*|Y*) ;;
+    *) echo "Aborted - nothing was changed."; exit 0 ;;
+  esac
+
+  restored=0
+  failed=0
+  for n in $SEL_IDX; do
+    oi="${DISP[$n]}"
+    if unarchive_file "${ARCH_FILES[$oi]}"; then
+      restored=$((restored + 1))
+      echo "  ^ ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+    else
+      failed=$((failed + 1))
+      echo "  ! FAILED (file locked or unwritable?): ${ARCH_PROJ[$oi]}: ${ARCH_TITLES[$oi]}"
+    fi
+  done
+
+  echo ""
+  if [ "$failed" -gt 0 ]; then
+    echo "Restored $restored chat(s); $failed could not be changed (left archived)."
+    echo "Switch to that account (or restart Claude Desktop) to see the restored ones."
+    exit 1
+  fi
+  echo "Restored $restored chat(s). Switch to that account (or restart Claude Desktop) to see them in the active list."
+  exit 0
+fi
 
 select_pair
 
