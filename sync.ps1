@@ -8,6 +8,7 @@
 #
 # This script reconciles from source to destination: it copies missing entries
 # and updates existing entries whose sidebar metadata differs. It never deletes.
+# Claude must be closed before writing; each run saves a destination backup.
 #
 # It can also restore archived chats: -Unarchive flips an account's archived
 # sidebar entries back to active so they reappear in the main chat list.
@@ -27,6 +28,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'sync-safety.ps1')
 
 # Allow overriding the store location (e.g. portable installs). Otherwise try
 # known install paths, then do a bounded search under app-data roots.
@@ -134,6 +136,10 @@ function Get-ClaudeUserDataCandidates {
     foreach ($candidate in Get-KnownClaudeUserDataCandidates) {
         Add-UniquePath $candidates $candidate
     }
+    # Only search recursively when the known locations contain no usable store.
+    if (@($candidates | Where-Object { (Get-ClaudeSessionStoreInfo $_).IsValid }).Count -gt 0) {
+        return @($candidates)
+    }
     foreach ($candidate in Find-ClaudeUserDataCandidates) {
         Add-UniquePath $candidates $candidate
     }
@@ -151,6 +157,12 @@ $ValidStores = @($StoreMatches | Where-Object { $_.IsValid } | Sort-Object ChatC
 $UserData = if ($ValidStores.Count -gt 0) { $ValidStores[0].UserData } else { $UserDataCandidates[0] }
 $StoreDir  = Join-Path $UserData 'claude-code-sessions'
 $LogFile   = Join-Path $UserData 'logs\main.log'
+if ($env:LOCALAPPDATA) {
+    $logCandidates = @($LogFile, (Join-Path $env:LOCALAPPDATA 'Claude\Logs\main.log'))
+    $latestLog = $logCandidates | Where-Object { Test-Path -LiteralPath $_ } |
+        Get-Item | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latestLog) { $LogFile = $latestLog.FullName }
+}
 $LabelFile = Join-Path $PSScriptRoot 'accounts.conf'
 
 if (-not (Test-Path $StoreDir)) {
@@ -253,7 +265,7 @@ $AutoLabels = Get-AccountIdentityLabels $UserData
 # ---------------------------------------------------------------------------
 $LastSignedIn = $null
 if (Test-Path $LogFile) {
-    $idLines = @(Select-String -Path $LogFile -Pattern '\[account\] Identity changed' -ErrorAction SilentlyContinue)
+    $idLines = @(Select-String -Path $LogFile -Pattern '\[account\] (Identity changed|Login-state transition)' -ErrorAction SilentlyContinue)
     if ($idLines.Count -gt 0) {
         $uuidMatches = [regex]::Matches($idLines[-1].Line, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
         if ($uuidMatches.Count -gt 0) {
@@ -267,13 +279,15 @@ if (Test-Path $LogFile) {
 # ---------------------------------------------------------------------------
 $Buckets = @()
 foreach ($accDir in Get-ChildItem $StoreDir -Directory) {
+    if ($accDir.Name -notmatch '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$') { continue }
     foreach ($orgDir in Get-ChildItem $accDir.FullName -Directory) {
+        if ($orgDir.Name -notmatch '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$') { continue }
         $files = @(Get-ChildItem $orgDir.FullName -Filter 'local_*.json' -File | Sort-Object LastWriteTime -Descending)
 
         $titles = @()
         $projectCounts = @{}
         foreach ($f in $files) {
-            try { $j = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            try { $j = Get-Content $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
             if ($titles.Count -lt 3 -and $j.title) { $titles += $j.title }
             $proj = $null
             if ($j.originCwd) { $proj = Split-Path $j.originCwd -Leaf }
@@ -432,7 +446,7 @@ function Select-BucketPair {
 function Get-ChatTitle([string]$path) {
     $title = [IO.Path]::GetFileNameWithoutExtension($path)
     try {
-        $j = Get-Content $path -Raw | ConvertFrom-Json
+        $j = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($j.title) { $title = $j.title }
     } catch { }
     return $title
@@ -618,6 +632,7 @@ $dst = $Buckets[$dstIdx - 1]
 $srcFiles = @(Get-ChildItem $src.Path -Filter 'local_*.json' -File)
 $actions = @()
 foreach ($f in $srcFiles) {
+    $null = Read-SessionRecord $f.FullName
     $destPath = Join-Path $dst.Path $f.Name
     if (-not (Test-Path $destPath)) {
         $actions += [pscustomobject]@{
@@ -660,11 +675,7 @@ if ($DryRun) {
     exit 0
 }
 
-$claudeProc = Get-Process -Name 'Claude' -ErrorAction SilentlyContinue
-if ($claudeProc) {
-    Write-Host "Note: Claude Desktop is running. Copying is safe, but the sidebar only" -ForegroundColor Yellow
-    Write-Host "re-reads this folder on account switch or app restart." -ForegroundColor Yellow
-}
+Assert-ClaudeStopped
 
 $confirm = Read-Host "Apply $($toAdd.Count) add(s) and $($toUpdate.Count) update(s) from '$(Get-BucketDisplayName $src)' to '$(Get-BucketDisplayName $dst)'? [y/N]"
 if ($confirm -notmatch '^[yY]') {
@@ -677,8 +688,8 @@ if ($confirm -notmatch '^[yY]') {
 # ---------------------------------------------------------------------------
 $added = 0
 $updated = 0
+$backupPath = Invoke-SessionSync -Actions $actions -UserData $UserData -SourceBucket $src.Path -DestinationBucket $dst.Path
 foreach ($a in $actions) {
-    Copy-Item $a.Source $a.Destination -Force
     if ($a.Action -eq 'add') {
         $added++
         Write-Host ("  + {0}" -f $a.Title) -ForegroundColor Green
@@ -689,6 +700,6 @@ foreach ($a in $actions) {
 }
 
 Write-Host ""
-Write-Host "Applied $added add(s) and $updated update(s). Switch to that account (or restart Claude Desktop) to see them." -ForegroundColor Green
+Write-Host "Applied $added add(s) and $updated update(s). Reopen Claude Desktop and select the destination account to see them." -ForegroundColor Green
 Write-Host "Tip: destination-only chats are left alone. Archive state and renames follow"
 Write-Host "the source account when its sidebar JSON is updated."
