@@ -57,9 +57,14 @@ chat count, last activity, most-used projects, and recent chat titles, plus a
 macOS/Linux), you can still give any unidentified account a friendly name;
 names are remembered in `accounts.conf` next to the script.
 
+On Windows, fully quit Claude Desktop before applying a sync, including any
+remaining `Claude.exe` processes in Task Manager. Closing its window alone may
+leave a background process running. Listing accounts and previewing a dry run
+are allowed while Claude is open.
+
 Then pick a source and destination, review the planned adds/updates, confirm,
-done. Run it again with the accounts swapped if you want the other account's
-sidebar metadata to become the source of truth.
+and reopen Claude. Run it again with the accounts swapped if you want the
+other account's sidebar metadata to become the source of truth.
 
 In the interactive prompt, you can enter source and destination together as
 `1,2` to copy from account 1 to account 2.
@@ -76,8 +81,14 @@ In the interactive prompt, you can enter source and destination together as
   the next sync re-adds it (the file is "missing" again). Archive instead of
   delete if you want that hidden state to sync as metadata. Destination-only
   files are never deleted.
-- **Refresh.** The sidebar re-reads its bucket on account switch or app
-  restart, not live — switch away and back to see newly synced chats.
+- **Refresh.** Reopen Claude after syncing to reload its sidebar. Do not launch
+  Claude while a sync is in progress.
+- **Windows write protection.** `sync.ps1` refuses to write while a Claude
+  process is running. It validates source JSON and session IDs, stages the
+  records, saves originals, and replaces each file atomically. An I/O failure
+  triggers a rollback of files already applied; the backup is retained even
+  if rollback fails. This is per-file atomic replacement, not an atomic
+  transaction across the entire folder.
 - **MCP approvals.** Each entry records MCP connector approvals from the
   account it was created under. Under the other account those connector IDs
   don't exist; the chat works fine, but tool approvals may be re-prompted.
@@ -115,8 +126,45 @@ chat. Add `-DryRun` / `--dry-run` to preview without writing.
 This manipulates Claude Desktop's internal UI metadata, which is unsupported
 behavior — a future app version could change the format. The tool updates
 destination sidebar JSON files from the selected source, but never deletes
-destination-only files. If you want a safety net, copy the
-`claude-code-sessions` folder somewhere first.
+destination-only files. Windows syncs automatically save a backup under
+`<Claude user data>/claude-desktop-switcher-backups/<timestamp>-<id>/` before
+writing. `manifest.json` records the destination and which files already
+existed, `before/` holds their original bytes, and `staged/` holds the incoming
+records. Treat these backups as private session data. The macOS/Linux script
+does not yet have the Windows validation, backup, or rollback safeguards;
+fully quit Claude and copy `claude-code-sessions` somewhere safe before using it.
+
+To undo a Windows sync, first quit Claude and preserve a copy of the current
+destination bucket. Use that run's manifest: copy each `Existed: true` file
+from `before/` back into `DestinationBucket`, and remove only the files marked
+`Existed: false` by that run. This discards later sidebar changes to those
+specific files, so inspect the current files before restoring an older backup.
+
+### Claude hangs on the initial spinner
+
+First fully quit Claude, check Task Manager for leftover Claude Desktop
+processes, end those remaining processes, and reopen it. An old process can
+remain after its window closes; a subsequent instance may stall while reading
+its local web cache. This was observed with account initialization failing
+alongside `IndexedDB cache read did not settle within the restore timeout`.
+Restarting all Desktop processes restored loading without resetting the cache
+or removing chats. Avoid ending an unrelated Claude Code CLI task.
+
+For diagnosis, newer Windows versions write logs to
+`%LOCALAPPDATA%\Claude\Logs\main.log` and `claude.ai-web.log`; older versions
+use `<Claude user data>\logs\`. The Windows script checks the newest available
+main log when identifying the last signed-in account. A spinner alone does
+not establish that sidebar records are corrupt.
+
+### Windows regression tests
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/sync-safety.tests.ps1
+```
+
+The tests use temporary synthetic session stores and cover the running-process
+guard, malformed records, UTF-8 copying, backups, destination-only files, and
+rollback after a locked-file write failure. They do not modify your Claude data.
 
 If your install keeps its data somewhere non-standard, set `CLAUDE_USER_DATA`
 to the app's data folder before running.
