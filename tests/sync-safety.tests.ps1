@@ -28,7 +28,42 @@ function Put-Record([string]$Folder, [string]$Name, [string]$Title) {
 }
 function Read-BytesText([string]$Path) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) }
 
+function Test-ClaudeDataDiscovery {
+    $oldRoaming = $env:APPDATA
+    $oldLocal = $env:LOCALAPPDATA
+    $oldOverride = $env:CLAUDE_USER_DATA
+    try {
+        $env:APPDATA = Join-Path $root 'Roaming'
+        $env:LOCALAPPDATA = Join-Path $root 'Local'
+        $env:CLAUDE_USER_DATA = $null
+
+        $legacy = Join-Path $env:APPDATA 'Claude\claude-code-sessions'
+        $packaged = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_testpackage\claude-code-sessions'
+        $firstBucket = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $secondBucket = 'cccccccc-cccc-cccc-cccc-cccccccccccc\bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $legacyBucket = Join-Path $legacy $firstBucket
+        $packagedFirst = Join-Path $packaged $firstBucket
+        $packagedSecond = Join-Path $packaged $secondBucket
+        $null = New-Item -ItemType Directory -Path $legacyBucket, $packagedFirst, $packagedSecond -Force
+        # Discovery filters by prefix only; short names avoid MAX_PATH in temp directories.
+        Put-Record $legacyBucket 'local_a.json' 'Legacy store entry'
+        Put-Record $packagedFirst 'local_a.json' 'Claude-Data first account'
+        Put-Record $packagedSecond 'local_b.json' 'Claude-Data second account'
+
+        $syncScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'sync.ps1'
+        $output = (& $syncScript -List 6>&1 | Out-String)
+        Assert ($LASTEXITCODE -eq 0) "Listing should find the Claude-Data store even with a valid legacy store: $output"
+        Assert ($output -like '*Claude-Data first account*' -and $output -like '*Claude-Data second account*') 'Both Claude-Data accounts should be listed'
+        Assert ($output -notlike '*Legacy store entry*') 'The larger Claude-Data store should win'
+    } finally {
+        $env:APPDATA = $oldRoaming
+        $env:LOCALAPPDATA = $oldLocal
+        $env:CLAUDE_USER_DATA = $oldOverride
+    }
+}
+
 try {
+    Test-ClaudeDataDiscovery
     Put-Record $source $one ('Renamed ' + [char]0x4e2d + [char]0x6587)
     Put-Record $source $two 'Added'
     Put-Record $destination $one 'Original'
@@ -71,7 +106,7 @@ try {
     } finally { $lock.Dispose() }
     Assert ((Read-BytesText (Join-Path $destination $one)) -eq $preFailure) 'Earlier updates roll back after replace failure'
     Assert (@(Get-ChildItem -LiteralPath $destination -Filter '.sync-*.tmp' -Force).Count -eq 0) 'Temporary files are cleaned up'
-    Write-Host 'PASS: running-app guard, malformed JSON, identity validation, add/update, UTF-8, backup, destination-only preservation, I/O rollback.'
+    Write-Host 'PASS: Claude-Data discovery, running-app guard, malformed JSON, identity validation, add/update, UTF-8, backup, destination-only preservation, I/O rollback.'
 } finally {
     # The only deletion target is this test's unique, verified temp directory.
     $resolved = [IO.Path]::GetFullPath($root)
