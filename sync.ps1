@@ -54,6 +54,13 @@ function Get-KnownClaudeUserDataCandidates {
                 Add-UniquePath $candidates (Join-Path $pkg.FullName 'LocalCache\Roaming\Claude')
             }
         }
+
+        $claudeDataRoot = Join-Path $env:LOCALAPPDATA 'Claude-Data'
+        if (Test-Path -LiteralPath $claudeDataRoot -PathType Container) {
+            foreach ($profile in Get-ChildItem -LiteralPath $claudeDataRoot -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue) {
+                Add-UniquePath $candidates $profile.FullName
+            }
+        }
     }
 
     return @($candidates)

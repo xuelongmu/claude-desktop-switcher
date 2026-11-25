@@ -17,6 +17,7 @@ Claude Desktop stores Claude Code chats in two layers:
    |---|---|
    | Windows | `%APPDATA%\Claude\claude-code-sessions\<account-uuid>\<org-uuid>\` |
    | Windows, packaged app | `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions\<account-uuid>\<org-uuid>\` |
+   | Windows, packaged app (Claude-Data) | `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code-sessions\<account-uuid>\<org-uuid>\` |
    | macOS | `~/Library/Application Support/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/` |
    | Linux | `~/.config/Claude/claude-code-sessions/<account-uuid>/<org-uuid>/` |
 
@@ -162,9 +163,10 @@ not establish that sidebar records are corrupt.
 powershell -NoProfile -ExecutionPolicy Bypass -File tests/sync-safety.tests.ps1
 ```
 
-The tests use temporary synthetic session stores and cover the running-process
-guard, malformed records, UTF-8 copying, backups, destination-only files, and
-rollback after a locked-file write failure. They do not modify your Claude data.
+The tests use temporary synthetic session stores and cover Windows store
+discovery, the running-process guard, malformed records, UTF-8 copying, backups,
+destination-only files, and rollback after a locked-file write failure. They
+do not modify your Claude data.
 
 If your install keeps its data somewhere non-standard, set `CLAUDE_USER_DATA`
 to the app's data folder before running.
