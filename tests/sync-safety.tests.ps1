@@ -75,7 +75,8 @@ try {
 } finally {
     # The only deletion target is this test's unique, verified temp directory.
     $resolved = [IO.Path]::GetFullPath($root)
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd($separator) + $separator
     if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
         [IO.Path]::GetFileName($resolved) -notmatch '^switcher-test-[0-9a-f]{32}$') { throw 'Unexpected test cleanup path' }
     Remove-Item -LiteralPath $resolved -Recurse -Force
